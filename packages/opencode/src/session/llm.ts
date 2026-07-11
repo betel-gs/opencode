@@ -12,6 +12,7 @@ import { LLMClient } from "@opencode-ai/llm/route"
 import type { LLMClientService } from "@opencode-ai/llm/route"
 import { GitLabWorkflowLanguageModel } from "gitlab-ai-provider"
 import { ProviderTransform } from "@/provider/transform"
+import { groqTextToolCallMiddleware } from "./llm/groq-toolcall"
 import { Config } from "@/config/config"
 import type { Agent } from "@/agent/agent"
 import type { MessageV2 } from "./message-v2"
@@ -339,6 +340,12 @@ const live: Layer.Layer<
                   return args.params
                 },
               },
+              // Groq serves Llama/Qwen tool calls as assistant TEXT (not structured tool_calls); this
+              // rewrites those back into real tool-call parts. Gated to Groq llama/qwen so it can't
+              // touch well-behaved models (gpt-oss/openai/anthropic emit structured calls already).
+              ...(input.model.providerID === "groq" && /llama|qwen/i.test(input.model.id)
+                ? [groqTextToolCallMiddleware(new Set(Object.keys(prepared.tools)))]
+                : []),
             ],
           }),
           experimental_telemetry: {
