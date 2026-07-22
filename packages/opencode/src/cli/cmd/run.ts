@@ -697,6 +697,16 @@ export const RunCommand = effectCmd({
         async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
           const toggles = new Map<string, boolean>()
           let error: string | undefined
+          // Background-subagent DRAIN (headless): a background `task` launch returns a tool result
+          // <task id="X" state="running">, and its completion re-prompts this session with a synthetic
+          // <task id="X" state="completed|error"> message. Track both so the idle-break below does NOT
+          // exit while any launched background task is still pending — the run stays alive so each
+          // completion re-prompts the top-level agent (which can then run a dependent follow-up, e.g. the
+          // discovery report). Race-free: a job is only "done" once its completion tag appears, which is
+          // emitted AFTER the completion inject fires. Inert when no background task was launched
+          // (bgLaunched stays empty -> idle breaks exactly as before), so non-background runs are unchanged.
+          const bgLaunched = new Set<string>()
+          const bgDone = new Set<string>()
 
           for await (const event of events.stream) {
             if (
@@ -715,6 +725,26 @@ export const RunCommand = effectCmd({
             if (event.type === "message.part.updated") {
               const part = event.properties.part
               if (part.sessionID !== sessionID) continue
+
+              // Track background-subagent launches/completions for the drain (see idle-break below).
+              // A background launch is a COMPLETED tool part whose output carries state="running";
+              // a completion is any part text carrying state="completed|error".
+              {
+                const scan =
+                  part.type === "tool" && part.state.status === "completed"
+                    ? String((part.state as { output?: unknown }).output ?? "")
+                    : part.type === "text"
+                      ? String(part.text ?? "")
+                      : ""
+                if (scan) {
+                  if (part.type === "tool") {
+                    const launched = scan.match(/<task id="([^"]+)" state="running">/)
+                    if (launched) bgLaunched.add(launched[1])
+                  }
+                  const done = scan.match(/<task id="([^"]+)" state="(?:completed|error)">/)
+                  if (done) bgDone.add(done[1])
+                }
+              }
 
               if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
                 if (emit("tool_use", { part })) continue
@@ -790,6 +820,12 @@ export const RunCommand = effectCmd({
               event.properties.sessionID === sessionID &&
               event.properties.status.type === "idle"
             ) {
+              // Drain background subagents: if any launched-this-session background task hasn't yet
+              // reported completion, stay in the loop (its completion re-prompts this session with more
+              // events). Break only once all launched background tasks are done — or none were launched,
+              // in which case this is a no-op and idle breaks exactly as before.
+              const draining = [...bgLaunched].some((id) => !bgDone.has(id))
+              if (draining) continue
               break
             }
 
